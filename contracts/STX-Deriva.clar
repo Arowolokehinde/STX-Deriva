@@ -1,3 +1,5 @@
+;; Clarity Version
+
 
 ;; Description: Implementation of core derivatives trading functionality
 
@@ -29,15 +31,16 @@
     { stx-balance: uint })
 
 ;; Track positions
-(define-map positions 
-    uint 
+(define-map positions
+    uint
     { owner: principal,
       position-type: uint,
       size: uint,
       entry-price: uint,
       leverage: uint,
       collateral: uint,
-      liquidation-price: uint })
+      liquidation-price: uint,
+      opened-at: uint })
 
 ;; Position counter
 (define-data-var position-counter uint u0)
@@ -64,15 +67,49 @@
     (ok (var-get current-price)))
 
 ;; Calculate liquidation price
-(define-read-only (calculate-liquidation-price 
-    (entry-price uint) 
-    (position-type uint) 
+(define-read-only (calculate-liquidation-price
+    (entry-price uint)
+    (position-type uint)
     (leverage uint))
     (if (is-eq position-type TYPE-LONG)
         ;; Long position liquidation price
         (ok (/ (* entry-price (- u100 (/ u100 leverage))) u100))
         ;; Short position liquidation price
         (ok (/ (* entry-price (+ u100 (/ u100 leverage))) u100))))
+
+;; Get position type as ASCII string (Clarity 4)
+(define-read-only (get-position-type-string (position-type uint))
+    (if (is-eq position-type TYPE-LONG)
+        (ok "LONG")
+        (if (is-eq position-type TYPE-SHORT)
+            (ok "SHORT")
+            (err "UNKNOWN"))))
+
+;; Get position status including time held (Clarity 4)
+(define-read-only (get-position-status (position-id uint))
+    (match (get-position position-id)
+        position
+            (let ((time-held (- stacks-block-time (get opened-at position))))
+                (ok {
+                    owner-string: (unwrap-panic (to-ascii? (get owner position))),
+                    position-type-string: (unwrap-panic (get-position-type-string (get position-type position))),
+                    time-held: time-held
+                }))
+        (err "Position not found")))
+
+;; Check if position is at risk of liquidation (Clarity 4)
+(define-read-only (is-position-at-risk (position-id uint))
+    (match (get-position position-id)
+        position
+            (let ((current-price-val (var-get current-price))
+                  (at-risk (if (is-eq (get position-type position) TYPE-LONG)
+                              (<= current-price-val (/ (* (get liquidation-price position) u105) u100))
+                              (>= current-price-val (/ (* (get liquidation-price position) u95) u100)))))
+                (ok {
+                    at-risk: at-risk,
+                    at-risk-string: (unwrap-panic (to-ascii? at-risk))
+                }))
+        (err "Position not found")))
 
 ;; -----------------------------
 ;; Public Functions
@@ -81,18 +118,16 @@
 ;; Deposit collateral
 (define-public (deposit-collateral (amount uint))
     (let ((current-balance (get stx-balance (get-balance tx-sender))))
-        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-        (ok (map-set balances 
-            tx-sender 
+        (ok (map-set balances
+            tx-sender
             { stx-balance: (+ current-balance amount) }))))
 
 ;; Withdraw collateral
 (define-public (withdraw-collateral (amount uint))
     (let ((current-balance (get stx-balance (get-balance tx-sender))))
         (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
-        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
-        (ok (map-set balances 
-            tx-sender 
+        (ok (map-set balances
+            tx-sender
             { stx-balance: (- current-balance amount) }))))
 
 ;; Open position
@@ -125,7 +160,8 @@
                   entry-price: entry-price,
                   leverage: leverage,
                   collateral: required-collateral,
-                  liquidation-price: liquidation-price })
+                  liquidation-price: liquidation-price,
+                  opened-at: stacks-block-time })
             
             ;; Update balance
             (map-set balances 
@@ -141,16 +177,15 @@
     (let ((position (unwrap! (get-position position-id) ERR-INVALID-POSITION)))
         ;; Verify owner
         (asserts! (is-eq (get owner position) tx-sender) ERR-UNAUTHORIZED)
-        
+
         ;; Calculate PnL
-        (let ((pnl (calculate-pnl position)))
-            ;; Return collateral + PnL
-            (try! (as-contract 
-                   (stx-transfer? 
-                    (+ (get collateral position) pnl) 
-                    tx-sender 
-                    tx-sender)))
-            
+        (let ((pnl (calculate-pnl position))
+              (current-balance (get stx-balance (get-balance tx-sender))))
+            ;; Return collateral + PnL to user balance
+            (map-set balances
+                tx-sender
+                { stx-balance: (+ current-balance (+ (get collateral position) pnl)) })
+
             ;; Delete position
             (map-delete positions position-id)
             (ok true))))
@@ -160,13 +195,14 @@
 ;; -----------------------------
 
 ;; Calculate PnL (simplified)
-(define-private (calculate-pnl (position {owner: principal, 
+(define-private (calculate-pnl (position {owner: principal,
                                         position-type: uint,
                                         size: uint,
                                         entry-price: uint,
                                         leverage: uint,
                                         collateral: uint,
-                                        liquidation-price: uint}))
+                                        liquidation-price: uint,
+                                        opened-at: uint}))
     (let ((current-price-local (var-get current-price))
           (price-diff (if (is-eq (get position-type position) TYPE-LONG)
                          (- current-price-local (get entry-price position))
